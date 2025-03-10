@@ -1,0 +1,1192 @@
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <ESP8266WiFi.h>
+#include <HX711.h>
+#include <LiquidCrystal_I2C.h>
+#include <NTPClient.h>
+#include <NewPing.h>
+#include <Servo.h>
+#include <WiFiUdp.h>
+#include <Wire.h>
+
+// Project configuration files
+#include "config.h"
+#include "pins.h"
+#include "secret.h"
+
+// Include helper files
+#include "helpers/display_helpers.h"
+#include "helpers/feeding_helpers.h"
+#include "helpers/lcd_helpers.h"
+#include "helpers/scale_helpers.h"
+#include "helpers/water_helpers.h"
+#include "helpers/web_helpers.h"
+
+// Global objects
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_X, LCD_Y);
+NewPing sonar(TRIG_PIN, ECHO_PIN, MAX_DISTANCE);
+Servo hatchServo;
+HX711 scale;
+StaticJsonDocument<512>
+    jsonDoc;  // Define jsonDoc directly here instead of in globals.h
+
+// Define NTP Client to get time
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, NTP_SERVER, NTP_OFFSET, NTP_UPDATE_INTERVAL);
+
+// Add missing WebSocketsClient declaration
+WebSocketsClient webSocket;
+String clientId = "";       // Will be set in webInit
+bool webConnected = false;  // Track connection status
+
+// Add this to the global variables section
+bool isBusy = false;
+bool isFeeding = false;
+bool isWatering = false;
+
+// Function prototypes
+// Setup functions
+static bool setupLCD();
+static bool setupPins();
+static bool setupScale();
+static bool setupWiFi();
+static bool setupNTPTimer();
+// Helper functions
+static bool checkAnyButtonPressed();
+// Utility functions
+static void nonBlockingWait(uint32_t waitTime, uint32_t startDisplayTime = 0);
+static void showSetupStep(const char* setupName, bool (*setupFunction)(),
+                          uint32_t timeout);
+
+// Function declarations for use across files
+extern bool isWebConnected();
+extern bool sendFeedNow(int portionSize);
+extern bool sendWaterNow(int waterAmount);
+extern bool sendLogEvent(const char* eventType, const char* details);
+
+// Fix for missing function declarations
+void showSystemStatusScreen();
+void showLevelsScreen();
+void showNextFeedingScreen();
+void activateDisplay();
+void deactivateDisplay();
+void checkDisplayUpdate(uint32_t currentMillis);
+float getDistance();
+
+// Added function declaration for WebSocket command handler - updated to const
+// reference
+void handleWebSocketCommand(const char* command, const JsonDocument& doc);
+
+// New global variables for offline mode
+static uint32_t lastOfflineFeedTime = 0;
+static const uint32_t OFFLINE_FEED_INTERVAL =
+    8 * 60 * 60 * 1000;  // 8 hours in milliseconds
+static bool offlineModeActive = false;
+static bool offlinePromptShown = false;
+
+// Use DisplayState enum from display_helpers.h instead of redefining it
+// External references to display variables
+extern DisplayState currentDisplayState;
+extern uint32_t displayStateChangeTime;
+extern const uint32_t DISPLAY_STATE_DURATION;
+extern bool displayActive;
+
+static uint32_t lastScheduleCheckTime = 0;
+uint32_t lastInfoDisplayUpdate = 0;
+
+void setup() {
+#ifdef DEBUG
+  Serial.begin(115200);
+  delay(50);  // Delay for stability
+  Serial.setDebugOutput(true);
+  DEBUG_PRINTLN(F("IoT Pet Feeder Initializing - Improved Version"));
+#endif
+
+  // Step 1: Setting up the LCD display
+  setupLCD();
+  // Step 2: Setting up GPIO pins
+  showSetupStep("Setting up GPIOs", setupPins, 5000);
+  // Step 3: Setting up the HX711 load cell amplifier
+  showSetupStep("Setting up scale", setupScale, 15000);
+  // Step 4: Setting up WiFi connection
+  showSetupStep("Connect to WiFi", setupWiFi, 20000);
+  // Step 5: Setting up NTP time synchronization
+  showSetupStep("Setting up NTP", setupNTPTimer, 8000);
+
+  // Setup web connection after WiFi connection
+  if (WiFi.status() == WL_CONNECTED) {
+    if (webInit(WEB_SERVER_URL, WEB_CLIENT_ID)) {
+      char message[32];
+      snprintf(message, sizeof(message), "ID: %s", WEB_CLIENT_ID);
+      lcdMessage("Socket.IO", "Connecting...", INFO_DISPLAY_TIME);
+
+      // Log connection message will be sent after connection established
+    } else {
+      lcdMessage("Socket.IO", "Init Failed", INFO_DISPLAY_TIME);
+      activateOfflineMode();  // Activate offline mode if WebSocket connection
+                              // fails
+    }
+  } else {
+    activateOfflineMode();  // Activate offline mode if WiFi connection fails
+  }
+
+  // Show overall status but ALWAYS continue to loop()
+  // Use INFO_DISPLAY_TIME (3 seconds) for this important system status message
+  char statusMsg[16];
+  if (WiFi.status() == WL_CONNECTED) {
+    strcpy(statusMsg, "System ready!");
+  } else {
+    strcpy(statusMsg, "Offline Mode");
+  }
+  lcdMessage("Setup completed!", statusMsg, INFO_DISPLAY_TIME);
+}
+
+// New function to activate offline mode
+void activateOfflineMode() {
+  offlineModeActive = true;
+  offlinePromptShown = false;
+  lastOfflineFeedTime = millis();
+  DEBUG_PRINTLN(F("Offline mode activated"));
+  lcdMessage("Offline Mode", "Activated", INFO_DISPLAY_TIME);
+}
+
+// Function to check if it's time for offline feeding
+bool isTimeForOfflineFeeding() {
+  return offlineModeActive &&
+         (millis() - lastOfflineFeedTime >= OFFLINE_FEED_INTERVAL);
+}
+
+void loop() {
+  static uint32_t lastUserActivityTime = millis();  // Initialize on first run
+
+  // Static variables for interval management
+  static uint32_t lastWaterCheckTime = 0;
+  static uint32_t lastNtpUpdateTime = 0;
+  static uint32_t lastWebUpdateTime = 0;
+  static uint32_t lastDisplayUpdateTime = 0;
+  static uint32_t lastInfoDisplayUpdate = 0;
+  static bool scheduledFeedingDisplayed = false;
+
+  // Allow background tasks to run
+  yield();
+
+  // Get current time once per loop iteration
+  uint32_t currentMillis = millis();
+
+  // Check for any button press - this happens on every loop for responsiveness
+  if (checkAnyButtonPressed()) {
+    // Always update activity timestamp on button press
+    lastUserActivityTime = currentMillis;
+    displayActive = true;
+    lcd.backlight();  // Turn on backlight
+
+    // Handle manual feeding button specifically
+    if (digitalRead(MANUAL_FEED_BUTTON_PIN) == LOW) {
+      // First, notify server about manual feeding if connected
+      if (isWebConnected()) {
+        sendLogEvent("manual_feed_initiated", "Manual feeding button pressed");
+      }
+
+      // Perform feeding
+      feeding(false);  // Manual feeding
+
+      // If in offline mode, reset the feeding timer
+      if (offlineModeActive) {
+        lastOfflineFeedTime = currentMillis;
+        offlinePromptShown = false;
+      }
+    }
+  }
+
+  // Check if LCD is active and should show info
+  if (displayActive &&
+      currentMillis - lastUserActivityTime < LCD_BACKLIGHT_TIMEOUT) {
+    // Toggle display state every DISPLAY_STATE_DURATION milliseconds
+    if (currentMillis - displayStateChangeTime > DISPLAY_STATE_DURATION) {
+      displayStateChangeTime = currentMillis;
+
+      // Cycle through display states
+      switch (currentDisplayState) {
+        case DISPLAY_STATUS:
+          currentDisplayState = DISPLAY_LEVELS;
+          break;
+        case DISPLAY_LEVELS:
+          if (!offlineModeActive && hasSchedules() && timeClient.isTimeSet()) {
+            currentDisplayState = DISPLAY_NEXT_FEEDING;
+          } else {
+            currentDisplayState = DISPLAY_STATUS;
+          }
+          break;
+        case DISPLAY_NEXT_FEEDING:
+          currentDisplayState = DISPLAY_STATUS;
+          break;
+        default:
+          currentDisplayState = DISPLAY_STATUS;
+          break;
+      }
+    }
+
+    // Update display content every second if display is active
+    if (currentMillis - lastInfoDisplayUpdate > 1000) {
+      lastInfoDisplayUpdate = currentMillis;
+      updateInfoDisplay();
+
+      // Send periodic status to server if we're busy (feeding/watering)
+      if (isBusy && isWebConnected() &&
+          currentMillis - lastWebUpdateTime > 1000) {
+        jsonDoc.clear();
+        jsonDoc["status"] =
+            isFeeding ? "feeding" : (isWatering ? "watering" : "busy");
+        jsonDoc["progress"] = "ongoing";
+        sendMessage("operation-status", jsonDoc);
+      }
+    }
+  } else {
+    scheduledFeedingDisplayed = false;
+  }
+
+  // Check if LCD should be turned off due to inactivity
+  if (currentMillis - lastUserActivityTime >= LCD_BACKLIGHT_TIMEOUT) {
+    lcd.noBacklight();
+    displayActive = false;
+  }
+
+  // Handle offline mode
+  if (offlineModeActive) {
+    // Show prompt for manual feeding once after activation
+    if (!offlinePromptShown && currentMillis - lastOfflineFeedTime >
+                                   5000) {  // Wait 5 seconds after activation
+      lcdMessage("Offline Mode", "Press to Feed", INFO_DISPLAY_TIME);
+      lcd.backlight();  // Turn on backlight to draw attention
+      lastUserActivityTime = currentMillis;  // Reset activity timer
+      offlinePromptShown = true;
+    }
+
+    // Check if it's time for auto feeding in offline mode
+    if (isTimeForOfflineFeeding()) {
+      DEBUG_PRINTLN(F("Auto feeding triggered in offline mode"));
+      lcdMessage("Offline Mode", "Auto Feeding...", QUICK_DISPLAY_TIME);
+
+      // Perform feeding and reset timer
+      feeding(true);  // Scheduled feeding
+      lastOfflineFeedTime = currentMillis;
+    }
+  }
+  // Online mode time-based operations
+  else if (currentMillis - lastNtpUpdateTime >= 60000) {
+    lastNtpUpdateTime = currentMillis;
+    if (timeClient.update()) {
+      // After updating time, check feeding schedules
+      if (isWebConnected() && webConnected) {
+        lastScheduleCheckTime = currentMillis;
+        checkSchedules();
+      }
+    }
+  }
+
+  // Check if it's time for a scheduled feeding (online mode)
+  if (!offlineModeActive && hasSchedules() && timeClient.isTimeSet()) {
+    uint32_t currentEpoch = timeClient.getEpochTime();
+    uint32_t nextFeeding = getNextScheduledFeeding();
+
+    // Show countdown if we have a scheduled feeding and LCD is on
+    if (nextFeeding > 0 &&
+        lastUserActivityTime + LCD_BACKLIGHT_TIMEOUT > currentMillis) {
+      // Update countdown display periodically
+      if (currentMillis - lastDisplayUpdateTime >= 1000) {
+        lastDisplayUpdateTime = currentMillis;
+
+        // Only show if no other activity is happening
+        if (!scheduledFeedingDisplayed) {
+          // Calculate time until feeding
+          int32_t secondsToFeeding = nextFeeding - currentEpoch;
+
+          // Show countdown if feeding is within the next hour
+          if (secondsToFeeding > 0 && secondsToFeeding < 3600) {
+            int minutes = secondsToFeeding / 60;
+            int seconds = secondsToFeeding % 60;
+
+            // Format countdown message
+            char countdownMsg[16];
+            snprintf(countdownMsg, sizeof(countdownMsg), "In %02d:%02d",
+                     minutes, seconds);
+
+            // Display on LCD
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print(F("Next feeding:"));
+            lcd.setCursor(0, 1);
+            lcd.print(countdownMsg);
+
+            scheduledFeedingDisplayed = true;
+          } else {
+            scheduledFeedingDisplayed = false;
+          }
+        }
+      }
+    }
+
+    // Time for scheduled feeding?
+    if (nextFeeding > 0 && currentEpoch >= nextFeeding) {
+      // Reset next feeding time to avoid multiple triggers
+      nextScheduledFeeding = 0;
+
+      // Show scheduled feeding message
+      lcdMessage("Schedule Active", "Starting feed...", QUICK_DISPLAY_TIME);
+
+      // Log the scheduled feeding event to server
+      if (isWebConnected()) {
+        sendLogEvent("scheduled_feed", "Auto feeding from schedule");
+      }
+
+      // Perform the feeding
+      feeding(true);  // Pass true to indicate this is a scheduled feeding
+
+      // Request updated schedules after feeding
+      lastScheduleCheckTime = currentMillis;
+      checkSchedules();
+    }
+  }
+
+  // Indicate scheduled feeding display is done when turning off LCD
+  if (currentMillis - lastUserActivityTime >= LCD_BACKLIGHT_TIMEOUT) {
+    scheduledFeedingDisplayed = false;
+  }
+
+  // Check water level at intervals
+  if (currentMillis - lastWaterCheckTime >= WATER_CHECK_INTERVAL) {
+    lastWaterCheckTime = currentMillis;
+    checkWaterLevel();  // From water_helpers.h
+  }
+
+  // Update web client status periodically
+  if (WiFi.status() ==
+      WL_CONNECTED) {  // Fixed: Using WiFi.status() == WL_CONNECTED
+    webUpdate();       // Process Socket.IO events frequently
+
+    // Send status updates at a slower pace
+    if (currentMillis - lastWebUpdateTime >= WEB_UPDATE_INTERVAL) {
+      lastWebUpdateTime = currentMillis;
+
+      // If connected to server, send sensor values
+      if (isWebConnected()) {
+        // Calculate food level if scale is available
+        if (scale.is_ready()) {
+          float currentWeight = scale.get_units(2);
+          if (currentWeight > 0) {
+            // Convert weight to percentage
+            float foodPercent = (currentWeight / FEED_TOTAL_WEIGHT) * 100.0;
+            foodPercent = constrain(foodPercent, 0, 100);
+
+            // Get distance from water surface if enabled
+            float waterPercent = 50.0;  // Default 50% if sensor not read
+
+            float distanceCm = getDistance();
+            if (distanceCm > 0) {
+              // Calculate water level percentage
+              float waterHeight = DISTANCE_WATER_EMPTY - distanceCm;
+              waterPercent =
+                  (waterHeight / (DISTANCE_WATER_EMPTY - DISTANCE_WATER_FULL)) *
+                  100;
+              waterPercent = constrain(waterPercent, 0, 100);
+            }
+
+            // Send update will happen in Socket.IO events
+          }
+        }
+      }
+    }
+  }
+  // Check for WiFi reconnection in offline mode
+  else if (offlineModeActive &&
+           WiFi.status() ==
+               WL_CONNECTED) {  // Fixed: Using WiFi.status() == WL_CONNECTED
+    // Try to reconnect to WebSocket server
+    if (webInit(WEB_SERVER_URL, WEB_CLIENT_ID)) {
+      offlineModeActive = false;
+      lcdMessage("Back Online", "Reconnected!", INFO_DISPLAY_TIME);
+    }
+  }
+
+  // Short delay with yield to prevent WDT
+  delay(10);
+  yield();
+}
+
+/* ----- Functions ------ */
+
+// Show a setup step with state machine for timeout detection
+void showSetupStep(const char* setupName, bool (*setupFunction)(),
+                   uint32_t timeout = SETUP_STEP_TIMEOUT) {
+  // Define the enum locally inside the function to save RAM
+  enum SetupState {
+    SETUP_START,
+    SETUP_RUNNING,
+    SETUP_COMPLETE,
+    SETUP_TIMEOUT,
+    SETUP_ERROR,
+    SETUP_FINISHED
+  };
+
+  bool setupSuccess = false;  // Default to failure
+
+  // Variables needed throughout the state machine
+  uint32_t startTime = millis();
+  SetupState state = SETUP_START;
+
+  while (state != SETUP_FINISHED) {
+    // Always yield to keep WiFi stack happy
+    yield();
+    delay(5);
+
+    // Switch based on current state
+    switch (state) {
+      case SETUP_START:
+        // Use lcdMessage for regular strings passed as params
+        lcdMessage(setupName, "Initializing...", QUICK_DISPLAY_TIME);
+        nonBlockingWait(QUICK_DISPLAY_TIME, startTime);
+        // Move to next state
+        state = SETUP_RUNNING;
+        break;
+
+      case SETUP_RUNNING:
+        // Run the setup function
+        setupSuccess = setupFunction();
+        setupSuccess ? state = SETUP_COMPLETE : state = SETUP_ERROR;
+
+        // Check for timeout
+        if (millis() - startTime > timeout) {
+          state = SETUP_TIMEOUT;
+        }
+        break;
+
+      case SETUP_COMPLETE:
+        // Success - show completion message, keep title consistent
+        lcdMessage(setupName, "Setup complete", INFO_DISPLAY_TIME);
+        nonBlockingWait(INFO_DISPLAY_TIME, millis());
+
+        // Set result and exit state machine
+        state = SETUP_FINISHED;
+        break;
+
+      case SETUP_TIMEOUT:
+        // Keep title consistent with error message
+        lcdMessage(setupName, "Setup timeout!", INFO_DISPLAY_TIME);
+        nonBlockingWait(INFO_DISPLAY_TIME, millis());
+
+        // Set result and exit state machine
+        state = SETUP_FINISHED;
+        break;
+
+      case SETUP_ERROR:
+        // Keep title consistent with error message
+        lcdMessage(setupName, "Setup failed!", INFO_DISPLAY_TIME);
+        nonBlockingWait(INFO_DISPLAY_TIME, millis());
+
+        // Set result and exit state machine
+        state = SETUP_FINISHED;
+        break;
+
+      case SETUP_FINISHED:
+        // Do nothing, exit state machine
+        break;
+    }
+  }
+  DEBUG_PRINTLN(F("Setup finished"));
+}
+
+// Setup LCD display
+bool setupLCD() {
+  DEBUG_PRINT(F("\n[1/5] Setting up LCD display..."));
+
+  Wire.begin(SDA_PIN, SCL_PIN);  // Setting up I2C protocols
+  delay(50);
+  DEBUG_PRINT(F("\nI2C protocol initiated successfully"));
+
+  Wire.beginTransmission(LCD_ADDR);
+  byte error = Wire.endTransmission();
+  if (error != 0) {
+    DEBUG_PRINT(F("\nLCD not found. Please checking the wiring connection"));
+    return false;
+  } else {
+    lcd.init();
+    lcd.backlight();
+    delay(5);
+    lcd.clear();
+    DEBUG_PRINT(F("\nLCD initiation completed successful"));
+
+    // Show welcome message using direct string literals
+    lcd.setCursor(0, 0);
+    lcd.print(F("IoT Pet Feeder"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Starting up..."));
+    nonBlockingWait(INFO_DISPLAY_TIME);
+    return true;
+  }
+}
+
+// Setup GPIO pins
+bool setupPins() {
+  DEBUG_PRINT("\n[2/5] Configuring I/O pins...");
+
+  pinMode(TRIG_PIN, OUTPUT);  // Sets the TRIG_PIN as an Output
+  pinMode(ECHO_PIN, INPUT);   // Sets the ECHO_PIN as an Input
+  pinMode(MANUAL_FEED_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(WATER_PUMP_RELAY_PIN, OUTPUT);
+  digitalWrite(WATER_PUMP_RELAY_PIN,
+               LOW);  // Set digital output as LOW for deactive relay
+  hatchServo.attach(SERVO_PIN);
+  hatchServo.write(SERVO_CLOSE_ANGLE);
+  nonBlockingWait(2000);  // Delay for stability
+
+  DEBUG_PRINT("\nPins initiation completed successful");
+  return true;
+}
+
+// Setup scale - improved with helpers
+bool setupScale() {
+  DEBUG_PRINTLN(F("[3/5] Initializing load cell scale..."));
+
+  // Initialize HX711 communication
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  yield();
+
+  // Use the improved checkScaleReady function from scale_helpers.h
+  bool scaleDetected = checkScaleReady(SCALE_TIMEOUT);
+
+  // Use an enum to improve readability
+  enum ScaleSetupState {
+    DETECTION_FAILED,
+    DETECTION_SUCCESS,
+    TARE_SUCCESS,
+    TARE_FAILED,
+    COMPLETE
+  };
+
+  // Determine initial state
+  ScaleSetupState state = scaleDetected ? DETECTION_SUCCESS : DETECTION_FAILED;
+
+  // Process based on state
+  switch (state) {
+    case DETECTION_FAILED:
+      DEBUG_PRINTLN(F("HX711 not detected. Check wiring connections."));
+      lcd.clear();
+      lcd.setCursor(0, 1);
+      lcd.print(F("HX711 not found!"));
+      nonBlockingWait(INFO_DISPLAY_TIME);
+      return false;
+
+    case DETECTION_SUCCESS:
+      DEBUG_PRINTLN(F("HX711 detected successfully!"));
+      lcd.setCursor(0, 1);
+      lcd.print(F("HX711 detected!"));
+      nonBlockingWait(QUICK_DISPLAY_TIME);
+
+      // Apply calibration factor
+      scale.set_scale(CALIBRATION_FACTOR);
+      yield();
+
+      // Update LCD with taring status
+      lcd.setCursor(0, 1);
+      lcd.print(F("Taring scale..."));
+      nonBlockingWait(QUICK_DISPLAY_TIME);
+
+      // Take multiple tare readings for accuracy
+      scale.tare(5);  // Average of 5 readings
+      yield();
+
+      // Verify scale is working after tare and update state
+      state = checkScaleReady(2000) ? TARE_SUCCESS : TARE_FAILED;
+      break;
+  }
+
+  // Second switch for post-detection states
+  switch (state) {
+    case TARE_SUCCESS:
+      DEBUG_PRINTLN(F("Scale tared successfully!"));
+      lcd.setCursor(0, 1);
+      lcd.print(F("Tare completed!"));
+      nonBlockingWait(QUICK_DISPLAY_TIME);
+
+      DEBUG_PRINTLN(F("Scale initialization complete!"));
+      lcd.setCursor(0, 1);
+      lcd.print(F("Scale ready!    "));
+      nonBlockingWait(QUICK_DISPLAY_TIME);
+      return true;
+
+    case TARE_FAILED:
+      DEBUG_PRINTLN(F("Scale not responding after tare!"));
+      lcd.setCursor(0, 1);
+      lcd.print(F("Scale not ready!"));
+      nonBlockingWait(INFO_DISPLAY_TIME);
+      return false;
+  }
+  return false;  // Fallback (should never reach here)
+}
+
+// Setup WiFi connection
+bool setupWiFi() {
+  DEBUG_PRINTLN(F("\n[4/5] Setting up WiFi..."));
+  WiFi.setAutoReconnect(true);
+
+  // Disconnect and prepare WiFi
+  WiFi.disconnect();
+  delay(150);
+  WiFi.mode(WIFI_STA);
+
+  // Try connecting up to MAX_RETRY_COUNT times
+  for (uint8_t attempt = 1; attempt <= MAX_RETRY_COUNT; attempt++) {
+    char attemptMsg[16];
+    snprintf(attemptMsg, sizeof(attemptMsg), "WiFi Setup (%d/%d)", attempt,
+             MAX_RETRY_COUNT);
+    lcdMessage(attemptMsg, WIFI_SSID, QUICK_DISPLAY_TIME);
+    nonBlockingWait(QUICK_DISPLAY_TIME);
+    uint32_t startTime = millis();
+
+    DEBUG_PRINTLN(F("Connecting to WiFi..."));
+    WiFi.begin(WIFI_SSID, WIFI_PSWD);
+
+    // Connection loop with timeout
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - startTime < CONNECTION_TIMEOUT) {
+      delay(100);
+      yield();
+    }
+
+    // Check if connected
+    if (WiFi.status() == WL_CONNECTED) {
+      DEBUG_PRINTLN(F("WiFi connected successfully!"));
+      DEBUG_PRINT(F("IP: "));
+      DEBUG_PRINTLN(WiFi.localIP().toString());
+      WiFi.persistent(true);
+
+      lcdMessage("WiFi Connected!", WiFi.localIP().toString().c_str(),
+                 INFO_DISPLAY_TIME);
+      nonBlockingWait(INFO_DISPLAY_TIME);
+      return true;
+    } else {
+      // Failed attempt - show error message
+      const char* errorMsg;
+      switch (WiFi.status()) {
+        case WL_NO_SSID_AVAIL:
+          errorMsg = "SSID unavailable";
+          break;
+        case WL_CONNECT_FAILED:
+          errorMsg = "Auth Failed";
+          break;
+        case WL_DISCONNECTED:
+          errorMsg = "Disconnected";
+          break;
+        default:
+          errorMsg = "Connect Failed";
+          break;
+      }
+      lcdMessage("WiFi Connection", errorMsg, INFO_DISPLAY_TIME);
+      nonBlockingWait(INFO_DISPLAY_TIME);
+    }
+  }
+
+  // All attempts failed
+  DEBUG_PRINTLN(F("Failed to connect - all attempts exhausted"));
+  lcdMessage("Connect failed", "OFFLINE MODE", INFO_DISPLAY_TIME);
+  nonBlockingWait(INFO_DISPLAY_TIME);
+  return false;
+}
+
+// Setup NTP timer
+bool setupNTPTimer() {
+  if (WiFi.status() != WL_CONNECTED) {
+    DEBUG_PRINTLN("\nCannot start NTP timer without WiFi connection");
+    lcdMessage("NTP Timer", "No WiFi - Skip", INFO_DISPLAY_TIME);
+    nonBlockingWait(INFO_DISPLAY_TIME);
+    return false;
+  } else {
+    DEBUG_PRINT(F("\n[5/5] Synchronizing time...\nSetting up NTP Client..."));
+    timeClient.begin();
+    timeClient.update();
+    DEBUG_PRINT(F("\nSetting up NTP Client successful!\nNTP time: "));
+    DEBUG_PRINTLN(timeClient.getFormattedTime());
+    lcdMessage("NTP Timer", "Time synced", QUICK_DISPLAY_TIME);
+    nonBlockingWait(QUICK_DISPLAY_TIME);
+    return true;
+  }
+}
+
+// Non-blocking wait function
+void nonBlockingWait(uint32_t waitTime, uint32_t startDisplayTime) {
+  uint32_t actualWaitTime = waitTime;
+  if (LCD_TIMEOUT > 0 && startDisplayTime > 0) {
+    uint32_t elapsedDisplayTime = millis() - startDisplayTime;
+    if (elapsedDisplayTime >= LCD_TIMEOUT) {
+      // If we've already waited longer than minimum, don't wait more
+      return;
+    }
+    uint32_t remainingDisplayTime = LCD_TIMEOUT - elapsedDisplayTime;
+    // Use either the passed wait time or remaining display time, whichever is
+    // longer
+    actualWaitTime = max(waitTime, remainingDisplayTime);
+  }
+  uint32_t startWait = millis();
+  while (millis() - startWait < actualWaitTime) {
+    yield();    // Keep WiFi working
+    delay(10);  // Don't hog the CPU
+  }
+}
+
+// Check for any button press
+bool checkAnyButtonPressed() {
+  if (digitalRead(MANUAL_FEED_BUTTON_PIN) == LOW) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Update feeding status to server with information about scheduled vs manual
+ * @param dispensedWeight Amount of food dispensed in grams
+ * @param isScheduled Whether this was a scheduled feeding (true) or manual
+ * (false)
+ */
+void updateFeedingToServer(float dispensedWeight, bool isScheduled = false) {
+  if (isWebConnected()) {
+    // Calculate food level percentage based on weight
+    float foodLevel =
+        (FEED_TOTAL_WEIGHT - dispensedWeight) / FEED_TOTAL_WEIGHT * 100.0;
+    foodLevel = constrain(foodLevel, 0, 100);
+
+    // Convert weight to portion size (approximately)
+    int portionSize = round(dispensedWeight);
+
+    // Send feeding notification via WebSocket
+    sendFeedNow(portionSize);
+
+    // Log the feeding event with source information
+    char details[48];
+    if (isScheduled) {
+      snprintf(details, sizeof(details), "Scheduled: %.1fg dispensed",
+               dispensedWeight);
+    } else {
+      snprintf(details, sizeof(details), "Manual: %.1fg dispensed",
+               dispensedWeight);
+    }
+    sendLogEvent("feeding_complete", details);
+  }
+}
+
+// Replace updateWaterLevelToServer function with Socket.IO version
+void updateWaterLevelToServer(float waterHeight) {
+  if (isWebConnected()) {
+    // Calculate water level percentage
+    float waterPercentage =
+        (waterHeight / (DISTANCE_WATER_EMPTY - DISTANCE_WATER_FULL)) * 100;
+    waterPercentage = constrain(waterPercentage, 0, 100);
+
+    // Convert percentage to water amount for the server (0-150ml range)
+    int waterAmount = map(constrain(waterPercentage, 0, 100), 0, 100, 0, 150);
+
+    // Send water notification via Socket.IO
+    sendWaterNow(waterAmount);
+
+    // Log the water event
+    char details[32];
+    snprintf(details, sizeof(details), "Water level: %.1f%%", waterPercentage);
+    sendLogEvent("water_level", details);
+  }
+}
+
+/**
+ * Update the info display based on current display state
+ */
+void updateInfoDisplay() {
+  switch (currentDisplayState) {
+    case DISPLAY_STATUS:
+      showSystemStatusScreen();
+      break;
+    case DISPLAY_LEVELS:
+      showLevelsScreen();
+      break;
+    case DISPLAY_NEXT_FEEDING:
+      showNextFeedingScreen();
+      break;
+  }
+}
+
+/**
+ * Show system status screen (connection info, time)
+ */
+void showSystemStatusScreen() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+
+  if (offlineModeActive) {
+    lcd.print(F("OFFLINE MODE"));
+  } else if (isWebConnected()) {
+    lcd.print(F("Connected"));
+  } else if (WiFi.isConnected()) {
+    lcd.print(F("WiFi Only"));
+  } else {
+    lcd.print(F("No Connection"));
+  }
+
+  lcd.setCursor(0, 1);
+
+  // Show time if available, otherwise uptime
+  if (timeClient.isTimeSet()) {
+    lcd.print(timeClient.getFormattedTime());
+  } else {
+    // Show uptime in format HH:MM:SS
+    uint32_t uptime = millis() / 1000;  // seconds
+    uint8_t seconds = uptime % 60;
+    uint8_t minutes = (uptime / 60) % 60;
+    uint8_t hours = (uptime / 3600) % 24;
+
+    char uptimeStr[16];
+    snprintf(uptimeStr, sizeof(uptimeStr), "Up: %02d:%02d:%02d", hours, minutes,
+             seconds);
+    lcd.print(uptimeStr);
+  }
+}
+
+/**
+ * Show food and water levels screen
+ */
+void showLevelsScreen() {
+  lcd.clear();
+
+  // Get food level
+  float foodLevel = 0;
+  if (scale.is_ready()) {
+    float currentWeight = scale.get_units(2);
+    if (currentWeight > 0) {
+      foodLevel = (currentWeight / FEED_TOTAL_WEIGHT) * 100.0;
+      foodLevel = constrain(foodLevel, 0, 100);
+    }
+  }
+
+  // Get water level
+  float waterLevel = 0;
+  float distanceCm = getDistance();
+  if (distanceCm > 0) {
+    float waterHeight = DISTANCE_WATER_EMPTY - distanceCm;
+    waterLevel =
+        (waterHeight / (DISTANCE_WATER_EMPTY - DISTANCE_WATER_FULL)) * 100;
+    waterLevel = constrain(waterLevel, 0, 100);
+  }
+
+  // Show food level on first line
+  lcd.setCursor(0, 0);
+  lcd.print(F("Food: "));
+  lcd.print((int)foodLevel);
+  lcd.print(F("%"));
+
+  // Show water level on second line
+  lcd.setCursor(0, 1);
+  lcd.print(F("Water: "));
+  lcd.print((int)waterLevel);
+  lcd.print(F("%"));
+}
+
+/**
+ * Show next feeding time screen
+ */
+void showNextFeedingScreen() {
+  if (!timeClient.isTimeSet() || !hasSchedules()) {
+    // Fall back to levels display if we can't show next feeding
+    showLevelsScreen();
+    return;
+  }
+
+  uint32_t currentEpoch = timeClient.getEpochTime();
+  uint32_t nextFeeding = getNextScheduledFeeding();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("Next feeding:"));
+
+  if (nextFeeding <= 0) {
+    lcd.setCursor(0, 1);
+    lcd.print(F("No schedule set"));
+    return;
+  }
+
+  // Calculate time until feeding
+  int32_t secondsToFeeding = nextFeeding - currentEpoch;
+
+  lcd.setCursor(0, 1);
+
+  if (secondsToFeeding <= 0) {
+    lcd.print(F("Due now!"));
+  } else {
+    // Format based on how far away the feeding is
+    if (secondsToFeeding < 60) {
+      // Less than a minute
+      lcd.print(F("In < 1 minute"));
+    } else if (secondsToFeeding < 3600) {
+      // Less than an hour
+      int minutes = secondsToFeeding / 60;
+      lcd.print(F("In "));
+      lcd.print(minutes);
+      lcd.print(F(" minute"));
+      if (minutes != 1) lcd.print(F("s"));
+    } else if (secondsToFeeding < 86400) {
+      // Less than a day
+      int hours = secondsToFeeding / 3600;
+      int minutes = (secondsToFeeding % 3600) / 60;
+      char timeStr[16];
+      snprintf(timeStr, sizeof(timeStr), "In %d hr %d min", hours, minutes);
+      lcd.print(timeStr);
+    } else {
+      // More than a day
+      int days = secondsToFeeding / 86400;
+      lcd.print(F("In "));
+      lcd.print(days);
+      lcd.print(F(" day"));
+      if (days != 1) lcd.print(F("s"));
+    }
+  }
+}
+
+// Add the WebSocket command handler for remote feeding commands - updated to
+// const reference
+void handleWebSocketCommand(const char* command, const JsonDocument& doc) {
+  DEBUG_PRINT(F("Handling WebSocket command: "));
+  DEBUG_PRINTLN(command);
+
+  // Block commands if device is busy
+  if (isBusy &&
+      (strcmp(command, "feed") == 0 || strcmp(command, "water") == 0)) {
+    DEBUG_PRINTLN(F("Device busy, ignoring command"));
+
+    // Send busy response
+    jsonDoc.clear();
+    jsonDoc["status"] = "busy";
+    jsonDoc["command"] = command;
+    jsonDoc["message"] = "Device is currently busy";
+    sendMessage("commandResponse", jsonDoc);
+    return;
+  }
+
+  // Handle different commands
+  if (strcmp(command, "feed") == 0) {
+    // Get portion size if provided, otherwise use default
+    int portionSize = FEED_WEIGHT;
+    if (doc.containsKey("portionSize")) {
+      portionSize = doc["portionSize"];  // Now using const reference correctly
+    }
+
+    // Display on LCD
+    char portionMsg[16];
+    snprintf(portionMsg, sizeof(portionMsg), "Portion: %dg", portionSize);
+    lcdMessage("Remote Feeding", portionMsg, QUICK_DISPLAY_TIME);
+
+    // Set busy flags
+    isBusy = true;
+    isFeeding = true;
+
+    // Send acknowledgment to server
+    jsonDoc.clear();
+    jsonDoc["status"] = "executing";
+    jsonDoc["command"] = "feed";
+    jsonDoc["portionSize"] = portionSize;
+    sendMessage("commandResponse", jsonDoc);
+
+    // Perform the feeding operation
+    float dispensedWeight =
+        feeding(true);  // True indicates remote/scheduled feeding
+
+    // Reset flags
+    isBusy = false;
+    isFeeding = false;
+
+    // Report back to server
+    updateFeedingToServer(dispensedWeight, true);
+
+    // Send completion notification
+    jsonDoc.clear();
+    jsonDoc["status"] = "completed";
+    jsonDoc["command"] = "feed";
+    jsonDoc["dispensedWeight"] = dispensedWeight;
+    sendMessage("commandResponse", jsonDoc);
+  } else if (strcmp(command, "water") == 0) {
+    // Get water amount if provided, otherwise use default
+    int waterAmount = WATER_AMOUNT;
+    if (doc.containsKey("waterAmount")) {
+      waterAmount = doc["waterAmount"];
+    }
+
+    // Get duration if provided
+    int duration =
+        doc.containsKey("duration") ? doc["duration"].as<int>() : 3000;
+
+    // Display on LCD
+    char waterMsg[16];
+    snprintf(waterMsg, sizeof(waterMsg), "Amount: %dml", waterAmount);
+    lcdMessage("Remote Watering", waterMsg, QUICK_DISPLAY_TIME);
+
+    // Set busy flags
+    isBusy = true;
+    isWatering = true;
+
+    // Send acknowledgment to server
+    jsonDoc.clear();
+    jsonDoc["status"] = "executing";
+    jsonDoc["command"] = "water";
+    jsonDoc["waterAmount"] = waterAmount;
+    sendMessage("commandResponse", jsonDoc);
+
+    // Perform watering operation
+    bool success = dispenseWater(waterAmount);
+
+    // Reset flags
+    isBusy = false;
+    isWatering = false;
+    // Get current water level
+    float waterDistance = getDistance();
+    float waterHeight = DISTANCE_WATER_EMPTY - waterDistance;
+
+    // Update water level on server
+    updateWaterLevelToServer(waterHeight);
+
+    // Send completion notification
+    jsonDoc.clear();
+    jsonDoc["status"] = success ? "completed" : "failed";
+    jsonDoc["command"] = "water";
+    sendMessage("commandResponse", jsonDoc);
+  } else if (strcmp(command, "test-water") == 0) {
+    int duration =
+        doc.containsKey("duration") ? doc["duration"].as<int>() : 1000;
+    int flowRate =
+        doc.containsKey("flowRate") ? doc["flowRate"].as<int>() : 100;
+
+    // Convert flow rate percentage to water amount
+    int waterAmount = (WATER_AMOUNT * flowRate) / 100;
+
+    // Display on LCD
+    char testMsg[16];
+    snprintf(testMsg, sizeof(testMsg), "Test: %d%%", flowRate);
+    lcdMessage("Test Watering", testMsg, QUICK_DISPLAY_TIME);
+
+    // Set busy flags
+    isBusy = true;
+    isWatering = true;
+
+    // Perform watering test
+    bool success = dispenseWater(waterAmount);
+
+    // Reset flags
+    isBusy = false;
+    isWatering = false;
+
+    // Send completion notification
+    jsonDoc.clear();
+    jsonDoc["status"] = success ? "completed" : "failed";
+    jsonDoc["command"] = "test-water";
+    sendMessage("commandResponse", jsonDoc);
+  } else if (strcmp(command, "get-status") == 0) {
+    // Send complete device status
+    jsonDoc.clear();
+
+    // Read food level
+    float foodLevel = 100.0;
+    if (scale.is_ready()) {
+      float currentWeight = scale.get_units(2);
+      if (currentWeight > 0) {
+        foodLevel = (currentWeight / FEED_TOTAL_WEIGHT) * 100.0;
+        foodLevel = constrain(foodLevel, 0, 100);
+      }
+    }
+
+    // Read water level
+    float distanceCm = getDistance();
+    float waterHeight = DISTANCE_WATER_EMPTY - distanceCm;
+    float waterLevel =
+        (waterHeight / (DISTANCE_WATER_EMPTY - DISTANCE_WATER_FULL)) * 100;
+    waterLevel = constrain(waterLevel, 0, 100);
+
+    // Compile status data
+    jsonDoc["status"] = isBusy ? "busy" : "ready";
+    jsonDoc["foodLevel"] = foodLevel;
+    jsonDoc["waterLevel"] = waterLevel;
+    jsonDoc["batteryLevel"] = 100;  // Placeholder
+    jsonDoc["wifiSignal"] = WiFi.RSSI();
+    jsonDoc["timestamp"] = timeClient.getEpochTime();
+    jsonDoc["nextFeeding"] = getNextScheduledFeeding();
+    jsonDoc["hasSchedules"] = hasSchedules();
+
+    sendMessage("device-status", jsonDoc);
+  } else {
+    DEBUG_PRINT(F("Unknown command: "));
+    DEBUG_PRINTLN(command);
+
+    // Send error response
+    jsonDoc.clear();
+    jsonDoc["status"] = "error";
+    jsonDoc["command"] = command;
+    jsonDoc["message"] = "Unknown command";
+    sendMessage("commandResponse", jsonDoc);
+  }
+}
+
+// Add proper definition for WebSocket event handler
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED:
+      webConnected = false;
+      DEBUG_PRINTLN(F("WebSocket Disconnected!"));
+      break;
+
+    case WStype_CONNECTED:
+      webConnected = true;
+      DEBUG_PRINTLN(F("WebSocket Connected!"));
+
+      // Register with server using the same format as Socket.IO would
+      jsonDoc.clear();
+      jsonDoc["deviceType"] = "feeder-device";
+      jsonDoc["version"] = "1.0";
+      jsonDoc["ip"] = WiFi.localIP().toString();
+      jsonDoc["batteryLevel"] = 100;  // Placeholder
+      jsonDoc["wifiSignal"] = WiFi.RSSI();
+      sendMessage("register", jsonDoc);
+
+      // Request initial data
+      jsonDoc.clear();
+      sendMessage("get-settings", jsonDoc);
+      sendMessage("get-schedules", jsonDoc);
+      break;
+
+    case WStype_TEXT:
+      // Process incoming message
+      processWebSocketMessage(payload, length);
+      break;
+
+    case WStype_PING:
+      DEBUG_PRINTLN(F("Ping received"));
+      // WebSocketsClient automatically responds to pings
+      break;
+
+    case WStype_PONG:
+      DEBUG_PRINTLN(F("Pong received"));
+      break;
+
+    case WStype_ERROR:
+      DEBUG_PRINTLN(F("WebSocket Error!"));
+      break;
+
+    default:
+      DEBUG_PRINT(F("Unknown WebSocket event type: "));
+      DEBUG_PRINTLN(type);
+      break;
+  }
+}
+
+// Add a function to send device log events
+void sendLogEvent(const char* eventType, const char* details) {
+  if (!isWebConnected()) return;
+
+  jsonDoc.clear();
+  jsonDoc["type"] = eventType;
+  jsonDoc["details"] = details;
+  jsonDoc["timestamp"] = timeClient.getEpochTime();
+
+  sendMessage("device-log", jsonDoc);
+}

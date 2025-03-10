@@ -1,0 +1,770 @@
+#include <Arduino.h>
+#include <ArduinoIoTCloud.h>
+#include <Arduino_ConnectionHandler.h>
+#include <ESP8266WiFi.h>
+#include <HX711.h>
+#include <LiquidCrystal_I2C.h>
+#include <NTPClient.h>
+#include <NewPing.h>
+#include <Servo.h>
+#include <Wire.h>
+
+// Project configuration files
+#include "config.h"
+#include "pins.h"
+#include "secret.h"
+
+// Global objects
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_X, LCD_Y);
+NewPing sonar(TRIG_PIN, ECHO_PIN, MAX_DISTANCE);
+Servo hatchServo;
+HX711 scale;
+
+// Define NTP Client to get time
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, NTP_SERVER, NTP_OFFSET, NTP_UPDATE_INTERVAL);
+
+// Cloud connection handler - use direct instance instead of pointer for better
+// memory management
+WiFiConnectionHandler connectionHandler(WIFI_SSID, WIFI_PSWD);
+
+// Arduino IoT Cloud Properties
+bool feedNowControl;
+bool waterNowControl;
+float foodLevelCloud;
+float waterLevelCloud;
+int portionSizeCloud;
+int waterAmountCloud;
+String feedingScheduleCloud;
+String lastFeedingTime;
+bool deviceBusy;
+String deviceStatus;
+
+// Arduino IoT Cloud Schedule Properties
+Schedule morningSchedule;
+Schedule afternoonSchedule;
+Schedule eveningSchedule;
+Schedule nightSchedule;
+Schedule customSchedule;
+
+// Local variables
+static uint32_t lastWaterCheckTime = 0;
+static uint32_t lastNtpUpdateTime = 0;
+static uint32_t lastSensorUpdateTime = 0;
+static const uint32_t WATER_CHECK_INTERVAL =
+    10000;  // Check water every 10 seconds
+static const uint32_t SENSOR_UPDATE_INTERVAL =
+    5000;  // Update sensor readings every 5 seconds
+
+// Scheduled feeding parameters
+struct ScheduledFeeding {
+  int hour;
+  int minute;
+  bool enabled;
+};
+
+// Maximum 5 scheduled feedings
+static ScheduledFeeding schedules[5];
+static uint8_t activeSchedules = 0;
+static uint32_t nextScheduledFeeding = 0;  // Unix timestamp of next feeding
+
+// Function prototypes
+void onFeedNowChange();
+void onWaterNowChange();
+void onFeedingScheduleChange();
+void onPortionSizeChange();
+void onWaterAmountChange();
+void setupSchedules();
+void checkAndHandleFeeding();
+
+void initProperties();
+bool setupLCD();
+bool setupPins();
+bool setupScale();
+bool setupNTPTimer();
+void feeding(bool isScheduled);
+bool dispenseWater(int waterAmount);
+void checkWaterLevel();
+float getDistance();
+float getFoodLevel();
+void updateSensorReadings();
+bool checkScaleReady(uint32_t timeout);
+void nonBlockingWait(uint32_t waitTime);
+void lcdMessage(const char* line1, const char* line2, uint32_t displayTime);
+
+// Arduino IoT Cloud initialization
+void initProperties() {
+  ArduinoCloud.setBoardId(DEVICE_ID);
+  ArduinoCloud.setThingId(THING_ID);
+  ArduinoCloud.setSecretDeviceKey(IOT_SECRET_KEY);  // From secret.h
+
+  ArduinoCloud.addProperty(feedNowControl, READWRITE, ON_CHANGE,
+                           onFeedNowChange);
+  ArduinoCloud.addProperty(waterNowControl, READWRITE, ON_CHANGE,
+                           onWaterNowChange);
+  ArduinoCloud.addProperty(foodLevelCloud, READ, ON_CHANGE, NULL);
+  ArduinoCloud.addProperty(waterLevelCloud, READ, ON_CHANGE, NULL);
+  ArduinoCloud.addProperty(portionSizeCloud, READWRITE, ON_CHANGE,
+                           onPortionSizeChange);
+  ArduinoCloud.addProperty(waterAmountCloud, READWRITE, ON_CHANGE,
+                           onWaterAmountChange);
+  ArduinoCloud.addProperty(feedingScheduleCloud, READWRITE, ON_CHANGE,
+                           onFeedingScheduleChange);
+  ArduinoCloud.addProperty(lastFeedingTime, READ, ON_CHANGE, NULL);
+  ArduinoCloud.addProperty(deviceBusy, READ, ON_CHANGE, NULL);
+  ArduinoCloud.addProperty(deviceStatus, READ, ON_CHANGE, NULL);
+
+  // Add schedule properties
+  ArduinoCloud.addProperty(morningSchedule, READWRITE);
+  ArduinoCloud.addProperty(afternoonSchedule, READWRITE);
+  ArduinoCloud.addProperty(eveningSchedule, READWRITE);
+  ArduinoCloud.addProperty(nightSchedule, READWRITE);
+  ArduinoCloud.addProperty(customSchedule, READWRITE);
+}
+
+// Replace pointer initialization in setup() with reference to the instance
+void setup() {
+#ifdef DEBUG
+  Serial.begin(115200);
+  delay(50);  // Delay for stability
+  Serial.setDebugOutput(true);
+  DEBUG_PRINTLN(F("IoT Pet Feeder with Arduino IoT Cloud - Initializing"));
+#endif
+
+  // Initialize default values
+  feedNowControl = false;
+  waterNowControl = false;
+  foodLevelCloud = 0.0;
+  waterLevelCloud = 0.0;
+  portionSizeCloud = FEED_WEIGHT;
+  waterAmountCloud = WATER_AMOUNT;
+  feedingScheduleCloud = "";
+  lastFeedingTime = "Never";
+  deviceBusy = false;
+  deviceStatus = "Starting up...";
+
+  // Setup hardware
+  setupLCD();
+  setupPins();
+  setupScale();
+
+  // Initialize cloud connection - modified to use direct instance
+  initProperties();
+  ArduinoCloud.begin(connectionHandler);
+
+  // Set debug message level
+  setDebugMessageLevel(DBG_INFO);
+  ArduinoCloud.printDebugInfo();
+
+  lcdMessage("Cloud IoT", "Connecting...", 2000);
+
+  // Wait for WiFi connection with timeout
+  uint32_t connectionStart = millis();
+  while (!connectionHandler.check() && millis() - connectionStart < 20000) {
+    ArduinoCloud.update();
+    delay(500);
+  }
+
+  if (connectionHandler.check()) {
+    lcdMessage("WiFi Connected!", WiFi.localIP().toString().c_str(), 2000);
+    setupNTPTimer();
+  } else {
+    lcdMessage("Cloud Connection", "Failed - Offline", 2000);
+  }
+
+  // Setup default schedules - will be overridden by cloud settings
+  setupSchedules();
+
+  deviceStatus = "Ready";
+
+  lcdMessage("Setup completed!", "System ready!", 3000);
+}
+
+void loop() {
+  // Update cloud connection
+  ArduinoCloud.update();
+
+  // Get current time once per loop iteration
+  uint32_t currentMillis = millis();
+
+  // Allow background tasks to run
+  yield();
+
+  // Check if any schedule is active and handle feeding
+  checkAndHandleFeeding();
+
+  // Update NTP time every minute
+  if (currentMillis - lastNtpUpdateTime >= 60000) {
+    lastNtpUpdateTime = currentMillis;
+    if (timeClient.update()) {
+      checkSchedules();
+    }
+  }
+
+  // Check water level at intervals
+  if (currentMillis - lastWaterCheckTime >= WATER_CHECK_INTERVAL) {
+    lastWaterCheckTime = currentMillis;
+    checkWaterLevel();
+  }
+
+  // Update sensor readings periodically
+  if (currentMillis - lastSensorUpdateTime >= SENSOR_UPDATE_INTERVAL) {
+    lastSensorUpdateTime = currentMillis;
+    updateSensorReadings();
+  }
+
+  // Check for scheduled feedings
+  if (nextScheduledFeeding > 0 && timeClient.isTimeSet()) {
+    uint32_t currentEpoch = timeClient.getEpochTime();
+
+    // Time for scheduled feeding?
+    if (currentEpoch >= nextScheduledFeeding) {
+      // Reset next feeding time to avoid multiple triggers
+      nextScheduledFeeding = 0;
+
+      if (!deviceBusy) {
+        lcdMessage("Schedule Active", "Starting feed...", 1000);
+        deviceStatus = "Scheduled feeding";
+        feeding(true);     // Pass true to indicate this is a scheduled feeding
+        checkSchedules();  // Update next scheduled feeding time
+      }
+    }
+  }
+
+  // Short delay with yield to prevent WDT
+  delay(10);
+  yield();
+}
+
+// Arduino IoT Cloud property callbacks
+
+void onFeedNowChange() {
+  if (feedNowControl && !deviceBusy) {
+    feedNowControl = false;  // Reset the button state
+    ArduinoCloud.update();   // Update cloud to reflect the changed state
+
+    lcdMessage("Cloud Command", "Feeding...", 1000);
+    deviceStatus = "Remote feeding";
+    feeding(false);  // Manual feeding from cloud
+  }
+}
+
+void onWaterNowChange() {
+  if (waterNowControl && !deviceBusy) {
+    waterNowControl = false;  // Reset the button state
+    ArduinoCloud.update();    // Update cloud to reflect the changed state
+
+    lcdMessage("Cloud Command", "Watering...", 1000);
+    deviceStatus = "Remote watering";
+    dispenseWater(waterAmountCloud);
+  }
+}
+
+void onPortionSizeChange() {
+  // Constrain to reasonable values
+  portionSizeCloud = constrain(portionSizeCloud, 5, MAX_FEED_WEIGHT);
+
+  // Show feedback
+  char message[16];
+  snprintf(message, sizeof(message), "Set to %dg", portionSizeCloud);
+  lcdMessage("Portion Size", message, 2000);
+}
+
+void onWaterAmountChange() {
+  // Constrain to reasonable values
+  waterAmountCloud = constrain(waterAmountCloud, 10, MAX_WATER_AMOUNT);
+
+  // Show feedback
+  char message[16];
+  snprintf(message, sizeof(message), "Set to %dml", waterAmountCloud);
+  lcdMessage("Water Amount", message, 2000);
+}
+
+void onFeedingScheduleChange() {
+  // This is now handled by the IoT Cloud Schedule objects
+  // We keep this for backward compatibility with the custom format
+  lcdMessage("Cloud Schedules", "Updated", 2000);
+}
+
+// Hardware setup functions
+
+bool setupLCD() {
+  DEBUG_PRINT(F("\nSetting up LCD display..."));
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  delay(50);
+  DEBUG_PRINT(F("\nI2C protocol initiated"));
+
+  Wire.beginTransmission(LCD_ADDR);
+  byte error = Wire.endTransmission();
+  if (error != 0) {
+    DEBUG_PRINT(F("\nLCD not found. Check wiring"));
+    return false;
+  } else {
+    lcd.init();
+    lcd.backlight();
+    delay(5);
+    lcd.clear();
+    DEBUG_PRINT(F("\nLCD initialization successful"));
+
+    // Show welcome message
+    lcd.clear();
+    lcd.print(F("IoT Pet Feeder"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Arduino Cloud"));
+    delay(2000);
+    return true;
+  }
+}
+
+bool setupPins() {
+  DEBUG_PRINT(F("\nConfiguring I/O pins..."));
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(MANUAL_FEED_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(WATER_PUMP_RELAY_PIN, OUTPUT);
+  digitalWrite(WATER_PUMP_RELAY_PIN, LOW);
+
+  hatchServo.attach(SERVO_PIN);
+  hatchServo.write(SERVO_CLOSE_ANGLE);
+  delay(500);
+
+  DEBUG_PRINT(F("\nPins configured successfully"));
+  return true;
+}
+
+bool setupScale() {
+  DEBUG_PRINTLN(F("Initializing load cell scale..."));
+
+  // Initialize HX711 communication
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  yield();
+
+  bool scaleDetected = checkScaleReady(3000);
+  if (!scaleDetected) {
+    lcdMessage("Scale Error", "Not detected!", 2000);
+    return false;
+  }
+
+  lcdMessage("Scale Detected", "Calibrating...", 1000);
+
+  // Apply calibration factor
+  scale.set_scale(CALIBRATION_FACTOR);
+  yield();
+
+  // Tare the scale
+  lcdMessage("Scale Setup", "Taring scale...", 1000);
+  scale.tare(5);  // Average of 5 readings
+  yield();
+
+  if (checkScaleReady(2000)) {
+    lcdMessage("Scale Ready", "Tare complete", 1000);
+    return true;
+  } else {
+    lcdMessage("Scale Error", "Tare failed", 2000);
+    return false;
+  }
+}
+
+// Update setupNTPTimer() to add better error handling
+bool setupNTPTimer() {
+  lcdMessage("Time Sync", "Setting up NTP", 1000);
+
+  // Set ESP8266 specific WiFi UDP settings
+  ntpUDP.begin(2390);  // Use a specific local port for NTP
+
+  timeClient.begin();
+
+  // Multiple attempts to update time
+  bool timeUpdated = false;
+  for (int i = 0; i < 3 && !timeUpdated; i++) {
+    timeUpdated = timeClient.update();
+    if (!timeUpdated) delay(1000);
+  }
+
+  if (timeUpdated) {
+    char timeStr[16];
+    snprintf(timeStr, sizeof(timeStr), "%s",
+             timeClient.getFormattedTime().c_str());
+    lcdMessage("Time Synced", timeStr, 2000);
+    return true;
+  } else {
+    lcdMessage("Time Sync", "Failed", 2000);
+    return false;
+  }
+}
+
+// Core functionality
+
+void feeding(bool isScheduled) {
+  deviceBusy = true;
+
+  // Constants for feeding behavior
+  const float PRE_CLOSE_THRESHOLD = 0.85;
+  const float FINAL_ACCURACY = 0.90;
+  const uint32_t MAX_FEEDING_TIME = 30000;  // 30 second timeout
+  const uint32_t SETTLE_TIME = 1500;
+
+  lcdMessage("Feeding", "Checking scale...", 1000);
+
+  // Check if scale is responding
+  if (!checkScaleReady(2000)) {
+    lcdMessage("Scale Error", "Cannot feed!", 2000);
+    deviceBusy = false;
+    deviceStatus = "Error: Scale";
+    return;
+  }
+
+  // Get initial weight
+  float initialWeight = 0;
+  for (int i = 0; i < 5; i++) {
+    if (scale.is_ready()) {
+      initialWeight += scale.get_units(2);
+    }
+    delay(100);
+  }
+  initialWeight /= 5;
+  if (initialWeight < 0) initialWeight = 0;
+
+  float targetWeight = initialWeight + portionSizeCloud;
+
+  // Start feeding process
+  lcdMessage("Feeding", "Opening hatch...", 1000);
+  hatchServo.write(SERVO_OPEN_ANGLE);
+  delay(500);
+
+  // Feeding loop variables
+  uint32_t startTime = millis();
+  bool targetReached = false;
+  bool preCloseExecuted = false;
+  float currentWeight = initialWeight;
+  float dispensedWeight = 0;
+
+  while (!targetReached && (millis() - startTime < MAX_FEEDING_TIME)) {
+    // Read weight
+    if (scale.is_ready()) {
+      currentWeight = scale.get_units(2);
+      dispensedWeight = currentWeight - initialWeight;
+
+      // Update progress display
+      int progressPercent = (dispensedWeight / portionSizeCloud) * 100;
+      progressPercent = constrain(progressPercent, 0, 100);
+
+      char progressMsg[16];
+      snprintf(progressMsg, sizeof(progressMsg), "Progress: %d%%",
+               progressPercent);
+      lcdMessage("Feeding", progressMsg, 0);
+
+      // Pre-close when close to target
+      if (!preCloseExecuted &&
+          dispensedWeight >= portionSizeCloud * PRE_CLOSE_THRESHOLD) {
+        hatchServo.write(SERVO_CLOSE_ANGLE);
+        preCloseExecuted = true;
+        lcdMessage("Feeding", "Closing hatch...", 500);
+        delay(SETTLE_TIME);
+
+        // Re-measure after settling
+        if (scale.is_ready()) {
+          currentWeight = scale.get_units(3);
+          dispensedWeight = currentWeight - initialWeight;
+
+          // If we reached target, exit loop
+          if (dispensedWeight >= portionSizeCloud * FINAL_ACCURACY) {
+            targetReached = true;
+          } else if (!targetReached &&
+                     dispensedWeight < portionSizeCloud * FINAL_ACCURACY) {
+            // Try once more if under-fed
+            lcdMessage("Feeding", "Need more food", 1000);
+            hatchServo.write(SERVO_OPEN_ANGLE);
+            delay(300);
+            preCloseExecuted = false;
+          }
+        }
+      }
+    }
+
+    // Allow ESP8266 background processing
+    yield();
+    delay(100);
+  }
+
+  // Ensure servo is closed
+  hatchServo.write(SERVO_CLOSE_ANGLE);
+  delay(500);
+
+  // Get final stable weight
+  float finalWeight = 0;
+  int validReadings = 0;
+
+  for (int i = 0; i < 5; i++) {
+    if (scale.is_ready()) {
+      finalWeight += scale.get_units(3);
+      validReadings++;
+    }
+    delay(200);
+  }
+
+  if (validReadings > 0) {
+    finalWeight /= validReadings;
+    dispensedWeight = finalWeight - initialWeight;
+    if (dispensedWeight < 0) dispensedWeight = 0;
+  }
+
+  // Update cloud with results
+  foodLevelCloud = getFoodLevel();
+
+  // Record feeding time
+  if (timeClient.isTimeSet()) {
+    lastFeedingTime = timeClient.getFormattedTime();
+  } else {
+    lastFeedingTime = "Just now";
+  }
+
+  // Show results
+  char resultMsg[16];
+  snprintf(resultMsg, sizeof(resultMsg), "Added: %.1fg", dispensedWeight);
+  lcdMessage("Feed Complete", resultMsg, 2000);
+
+  deviceBusy = false;
+  deviceStatus = "Ready";
+}
+
+bool dispenseWater(int waterAmount) {
+  deviceBusy = true;
+
+  // Calculate pump time based on water amount
+  // This depends on your pump's flow rate - adjust the multiplier as needed
+  int pumpTimeMs = waterAmount * 100;              // Example: 100ms per ml
+  pumpTimeMs = constrain(pumpTimeMs, 500, 10000);  // Reasonable limits
+
+  lcdMessage("Watering", "Pump active...", 1000);
+
+  // Activate water pump
+  digitalWrite(WATER_PUMP_RELAY_PIN, HIGH);
+
+  // Run pump for calculated time
+  uint32_t startTime = millis();
+  while (millis() - startTime < pumpTimeMs) {
+    // Update progress
+    int elapsed = millis() - startTime;
+    int percent = (elapsed * 100) / pumpTimeMs;
+
+    char progressMsg[16];
+    snprintf(progressMsg, sizeof(progressMsg), "Progress: %d%%", percent);
+    lcdMessage("Watering", progressMsg, 0);
+
+    delay(100);
+    yield();
+  }
+
+  // Turn off pump
+  digitalWrite(WATER_PUMP_RELAY_PIN, LOW);
+
+  // Update water level
+  waterLevelCloud = getWaterLevel();
+
+  lcdMessage("Water Complete", "Pump stopped", 2000);
+
+  deviceBusy = false;
+  deviceStatus = "Ready";
+  return true;
+}
+
+void checkWaterLevel() {
+  float waterLevel = getWaterLevel();
+  waterLevelCloud = waterLevel;
+
+  // Low water detection
+  if (waterLevel < 20.0) {
+    lcdMessage("Warning", "Water level low!", 2000);
+    deviceStatus = "Low water!";
+  }
+}
+
+// Utility functions
+
+float getDistance() {
+  uint32_t totalDistance = 0;
+  uint8_t validReadings = 0;
+
+  for (uint8_t i = 0; i < PING_SAMPLES; i++) {
+    yield();
+    uint32_t uS = sonar.ping();
+    yield();
+
+    if (uS > 0) {
+      totalDistance += sonar.convert_cm(uS);
+      validReadings++;
+    }
+    delay(10);
+  }
+
+  return (validReadings > 0) ? totalDistance / validReadings : 0;
+}
+
+float getWaterLevel() {
+  float distanceCm = getDistance();
+
+  if (distanceCm <= 0 || distanceCm > MAX_DISTANCE) {
+    return 0;  // Error case
+  }
+
+  // Calculate water height and percentage
+  float waterHeight = DISTANCE_WATER_EMPTY - distanceCm;
+  waterHeight =
+      constrain(waterHeight, 0, DISTANCE_WATER_EMPTY - DISTANCE_WATER_FULL);
+
+  float waterPercentage =
+      (waterHeight / (DISTANCE_WATER_EMPTY - DISTANCE_WATER_FULL)) * 100;
+  return constrain(waterPercentage, 0, 100);
+}
+
+float getFoodLevel() {
+  if (!scale.is_ready()) {
+    return 0;
+  }
+
+  // Take multiple readings for accuracy
+  float totalWeight = 0;
+  int validReadings = 0;
+
+  for (int i = 0; i < 3; i++) {
+    float weight = scale.get_units(2);
+    if (weight > 0) {
+      totalWeight += weight;
+      validReadings++;
+    }
+    delay(50);
+    yield();
+  }
+
+  if (validReadings == 0) {
+    return 0;
+  }
+
+  float averageWeight = totalWeight / validReadings;
+  float foodPercentage = (averageWeight / FEED_TOTAL_WEIGHT) * 100.0;
+  return constrain(foodPercentage, 0, 100);
+}
+
+void updateSensorReadings() {
+  // Only update if not busy with operations
+  if (!deviceBusy) {
+    foodLevelCloud = getFoodLevel();
+    waterLevelCloud = getWaterLevel();
+  }
+}
+
+bool checkScaleReady(uint32_t timeout) {
+  uint32_t startTime = millis();
+  while (millis() - startTime < timeout) {
+    if (scale.is_ready()) {
+      return true;
+    }
+    delay(100);
+    yield();
+  }
+  return false;
+}
+
+void setupSchedules() {
+  // Get current time as starting point for schedules
+  ScheduleTimeType currentTime = TimeService.getTime();
+  if (currentTime == 0) {
+    // If time not available, use a default start time (affects first boot only)
+    currentTime = TimeServiceClass::getTimeFromString("2023 Jan 01 00:00:00");
+  }
+
+  // One year from now as default end time
+  ScheduleTimeType oneYearFromNow = currentTime + (DAYS * 365);
+
+  // Default active period (2 minutes)
+  ScheduleTimeType activePeriod = MINUTES * 2;
+
+  // Setup morning schedule (7:00 AM daily)
+  ScheduleConfigurationType morningConfig =
+      Schedule::createDailyScheduleConfiguration(7, 0);
+  morningSchedule =
+      Schedule(currentTime, oneYearFromNow, activePeriod, morningConfig);
+
+  // Setup afternoon schedule (12:00 PM daily)
+  ScheduleConfigurationType afternoonConfig =
+      Schedule::createDailyScheduleConfiguration(12, 0);
+  afternoonSchedule =
+      Schedule(currentTime, oneYearFromNow, activePeriod, afternoonConfig);
+
+  // Setup evening schedule (5:00 PM daily)
+  ScheduleConfigurationType eveningConfig =
+      Schedule::createDailyScheduleConfiguration(17, 0);
+  eveningSchedule =
+      Schedule(currentTime, oneYearFromNow, activePeriod, eveningConfig);
+
+  // Setup night schedule (10:00 PM daily)
+  ScheduleConfigurationType nightConfig =
+      Schedule::createDailyScheduleConfiguration(22, 0);
+  nightSchedule =
+      Schedule(currentTime, oneYearFromNow, activePeriod, nightConfig);
+
+  // Setup custom schedule (3:30 PM daily as default)
+  ScheduleConfigurationType customConfig =
+      Schedule::createDailyScheduleConfiguration(15, 30);
+  customSchedule =
+      Schedule(currentTime, oneYearFromNow, activePeriod, customConfig);
+}
+
+void checkAndHandleFeeding() {
+  static bool previouslyActive = false;
+  bool currentlyActive = false;
+  String activeScheduleName = "";
+
+  // Check all schedules
+  if (morningSchedule.isActive()) {
+    currentlyActive = true;
+    activeScheduleName = "Morning";
+  } else if (afternoonSchedule.isActive()) {
+    currentlyActive = true;
+    activeScheduleName = "Afternoon";
+  } else if (eveningSchedule.isActive()) {
+    currentlyActive = true;
+    activeScheduleName = "Evening";
+  } else if (nightSchedule.isActive()) {
+    currentlyActive = true;
+    activeScheduleName = "Night";
+  } else if (customSchedule.isActive()) {
+    currentlyActive = true;
+    activeScheduleName = "Custom";
+  }
+
+  // Trigger feeding on schedule transition from inactive to active
+  if (currentlyActive && !previouslyActive && !deviceBusy) {
+    char scheduleMsg[16];
+    snprintf(scheduleMsg, sizeof(scheduleMsg), "%s Schedule",
+             activeScheduleName.c_str());
+    lcdMessage(scheduleMsg, "Starting feed...", 1000);
+    deviceStatus = "Scheduled feeding";
+    feeding(true);
+  }
+
+  previouslyActive = currentlyActive;
+}
+
+void nonBlockingWait(uint32_t waitTime) {
+  uint32_t startWait = millis();
+  while (millis() - startWait < waitTime) {
+    yield();
+    delay(10);
+  }
+}
+
+void lcdMessage(const char* line1, const char* line2, uint32_t displayTime) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
+
+  if (displayTime > 0) {
+    nonBlockingWait(displayTime);
+  }
+}

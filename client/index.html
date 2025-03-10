@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>IoT Pet Feeder Control</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>IoT Pet Feeder</h1>
+        <div class="connection-status">
+          <span id="status-indicator" class="disconnected">Disconnected</span>
+        </div>
+      </header>
+
+      <div class="dashboard">
+        <div class="status-panel">
+          <h2>System Status</h2>
+          <div class="level-container">
+            <div class="level-indicator">
+              <h3>Food Level</h3>
+              <div class="progress-container">
+                <div id="food-progress" class="progress-bar"></div>
+                <span id="food-percentage">0%</span>
+              </div>
+            </div>
+            <div class="level-indicator">
+              <h3>Water Level</h3>
+              <div class="progress-container">
+                <div id="water-progress" class="progress-bar"></div>
+                <span id="water-percentage">0%</span>
+              </div>
+            </div>
+          </div>
+          <div class="system-info">
+            <div class="info-row">
+              <span>Feeding System:</span>
+              <span id="feeding-status">Unknown</span>
+            </div>
+            <div class="info-row">
+              <span>Watering System:</span>
+              <span id="watering-status">Unknown</span>
+            </div>
+            <div class="info-row">
+              <span>Last Feeding:</span>
+              <span id="last-feeding">Unknown</span>
+            </div>
+            <div class="info-row">
+              <span>Next Feeding:</span>
+              <span id="next-feeding">Unknown</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="control-panel">
+          <h2>Controls</h2>
+          <div class="control-group">
+            <h3>Manual Feed</h3>
+            <div class="control-row">
+              <label for="portion-size">Portion Size:</label>
+              <input
+                type="range"
+                id="portion-size"
+                min="1"
+                max="10"
+                value="3"
+              />
+              <span id="portion-display">3g</span>
+            </div>
+            <button id="feed-button" class="primary-btn">Feed Now</button>
+          </div>
+
+          <div class="control-group">
+            <h3>Manual Water</h3>
+            <div class="control-row">
+              <label for="water-amount">Water Amount:</label>
+              <input
+                type="range"
+                id="water-amount"
+                min="10"
+                max="200"
+                value="150"
+                step="10"
+              />
+              <span id="water-display">150ml</span>
+            </div>
+            <button id="water-button" class="primary-btn">Water Now</button>
+          </div>
+
+          <div class="control-group">
+            <h3>Settings</h3>
+            <div class="control-row">
+              <label for="auto-watering">Auto Watering:</label>
+              <input type="checkbox" id="auto-watering" checked />
+            </div>
+            <div class="control-row">
+              <button id="save-settings" class="secondary-btn">
+                Save Settings
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="schedule-panel">
+          <h2>Feeding Schedule</h2>
+          <div id="schedule-container">
+            <!-- Schedules will be added here dynamically -->
+          </div>
+          <button id="add-schedule" class="secondary-btn">Add Schedule</button>
+          <button id="save-schedules" class="primary-btn">
+            Save Schedules
+          </button>
+        </div>
+
+        <div class="log-panel">
+          <h2>Activity Log</h2>
+          <div id="log-container" class="log-container">
+            <!-- Logs will be added here dynamically -->
+          </div>
+        </div>
+      </div>
+
+      <div id="message" class="message"></div>
+    </div>
+
+    <script src="script.js"></script>
+  </body>
+</html>
